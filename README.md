@@ -28,6 +28,8 @@
   - [II.B  Codebook collision rate](#iib--codebook-collision-rate)
   - [II.C  Catalog size scaling](#iic--catalog-size-scaling)
   - [II.D  Domain shift](#iid--domain-shift)
+  - [II.E  Cold-start item experiment](#iie--cold-start-item-experiment)
+  - [II.F  Inference latency breakdown](#iif--inference-latency-breakdown)
 ---
 
 ## Part I. Implementation Details
