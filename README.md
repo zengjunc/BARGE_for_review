@@ -171,7 +171,7 @@ src          ← seq_emb + ica_delta                            # done in caller
 
 Both decoders cross-attend to the same encoder memory. Their
 self-attention only sees the SIDs of their own view (the training-time
-teacher-forcing stream is view-$h$'s $L$ codes). The two towers
+teacher-forcing stream is view `h`'s `L` codes). The two towers
 therefore operate on the two disjoint sub-vector streams produced in
 §I.2 without interfering during autoregressive decoding. 
 
@@ -399,7 +399,7 @@ Points worth stressing:
 
 ### II.A  Additional ablation studies
 
-We remove one component at a time from the full BARGE: **w/o ICA** disables the item-context gate; **w/o HPR** sets $w_\text{HPR}=0$ and $\lambda_\ell\equiv 0$; **w/o DPD** collapses to $H=1$. BARGE reports mean ± std over 3 seeds.
+We remove one component at a time from the full BARGE: **w/o ICA** disables the item-context gate; **w/o HPR** sets `w_HPR = 0` and `λ = 0`; **w/o DPD** collapses to `H = 1`. BARGE reports mean ± std over 3 seeds.
 
 **Amazon Beauty.**
 
