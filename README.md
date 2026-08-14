@@ -16,7 +16,7 @@
 
 - [Part I. Implementation Details](#part-i-implementation-details)
   - [I.1  Overview and notation](#i1--overview-and-notation)
-  - [I.2  Multi-view RQ-VAE tokenizer (DPD tokenizer)](#i2--multi-view-rq-vae-tokenizer-dpd-tokenizer)
+  - [I.2  OSQ-VAE tokenizer](#i2--osq-vae-tokenizer)
   - [I.3  Item Context-Aware Attention (ICA)](#i3--item-context-aware-attention-ica)
   - [I.4  Dual-Path Decoding with OR-fusion (DPD)](#i4--dual-path-decoding-with-or-fusion-dpd)
   - [I.5  Hierarchical Path Reranker (HPR)](#i5--hierarchical-path-reranker-hpr)
@@ -37,7 +37,7 @@
 ### I.1  Overview and notation
 
 **Data flow.** Given a user history $u = (v_1, \ldots, v_T)$, every item
-$v_t$ is turned by a frozen multi-view RQ-VAE into an $L \times H$ block
+$v_t$ is turned by a frozen OSQ-VAE into an $L \times H$ block
 of discrete codes. Flattened per item, the model consumes a sequence of
 length $T \cdot L \cdot H$ (interleaved per layer:
 `[l0_h0, l0_h1, l1_h0, l1_h1, ...]`). An encoder-decoder Transformer then
@@ -61,15 +61,15 @@ $H$-tuple per RQ layer.
 
 | Name | Where it plugs in | Purpose |
 |------|-------------------|---------|
-| `MvRqVae` | Tokenizer | Turn one embedding into $H$ complementary code streams. |
-| `_compute_ica_context` | Encoder input, **before** position embeddings | Item-level context gating on the fused sub-token stream. |
+| OSQ-VAE | Tokenizer | Turn one embedding into $H$ complementary code streams. |
+| `_compute_ica_context` | Encoder input, before position embeddings | Item-level context gating on the fused sub-token stream. |
 | `n_heads` decoder towers | Per-view decoder | Independent per-view AR decoding sharing only encoder memory. |
 | `HierarchicalPathReranker` | Per decoder tower, per layer $\ell \ge 1$ | Path-level dual-tower InfoNCE reranker. |
 | `_fuse_per_view_scores` | Post beam-search | Fusion across $H$ views. |
 
-### I.2  Multi-view RQ-VAE tokenizer (DPD tokenizer)
+### I.2  OSQ-VAE tokenizer
 
-Implemented by `MvRqVae` and `MultiHeadQuantize`.
+Implemented by `MvRqVae` and `MultiHeadQuantize` (referred to **OSQ-VAE**).
 
 **Shapes.** Given $x \in \mathbb{R}^{B \times D_\text{text}}$:
 - `encoder(x)` → $z \in \mathbb{R}^{B \times D_z}$ ($D_z=32$).
@@ -115,7 +115,7 @@ position embeddings. It only exists on the encoder side.
 | Name | Shape |
 |------|-------|
 | `ica_query` | $(1, 1, D)$ |
-| `ica_attn` | `nn.MultiheadAttention(embed_dim=D, num_heads=max(1, D//32), batch_first=True)` |
+| `ica_attn` | `nn.MultiheadAttention(embed_dim=D, num_heads=max(1, D//32))` |
 | `ica_norm` | `LayerNorm(D)` |
 | `ica_proj` | `Linear(D, D) → GELU → Linear(D, D)` |
 | `ica_gate` | `Linear(2·D, D) → Sigmoid` |
@@ -166,8 +166,8 @@ src          ← seq_emb + ica_delta                            # done in caller
 | `start_token_embeddings[h]` (BOS) | per view | ✗ |
 | `transformer_decoders[h]` | per view | ✗ |
 | `sparse_output_projections[ℓ][h]` (D_attn → C_ℓ) | per view, per layer | ✗ |
-| `path_rerankers[h]` (§I.6) | per view | ✗ |
-| `reranker_path_embedders[h][ℓ]` (§I.6) | per view, per layer | ✗ |
+| `path_rerankers[h]` (§I.5) | per view | ✗ |
+| `reranker_path_embedders[h][ℓ]` (§I.5) | per view, per layer | ✗ |
 
 Both decoders cross-attend to the same encoder memory. Their
 self-attention only sees the SIDs of their own view (the training-time
@@ -190,17 +190,11 @@ per batch row):
 - For each candidate SID `s = (c_1, ..., c_L)` from view $h$, look up the
   item collision set $\Phi_h(s) \subseteq \mathcal{V}$ via
   `self.item_ids_by_view[h]`.
-- Item score for one candidate: `delta = lp - log|Φ_h(s)|`.
-- If the *same* item is captured by multiple beams within the *same*
-  view, we combine those `delta` values with **log-sum-exp** (numerically
-  stable form, see code) so that the intra-view score matches the
-  cross-view fusion below.
 
 **Cross-view OR-fusion** (`_fuse_per_view_scores`). All items that
-appear in *any* view's pool form a single union candidate set, and the
+appear in any view's pool form a single union candidate set, and the
 per-item scores from the views that contain it are combined by a
-configurable reduction (`lse` by default; `max` / `mean` / `rrf` are
-also supported for ablation). We use `lse` in the main experiments.
+configurable reduction. We use `lse` in the main experiments.
 
 ### I.5  Hierarchical Path Reranker (HPR)
 
@@ -235,7 +229,7 @@ score   ← (ctx * path).sum(-1) * temp[ℓ].clamp(0.01, 100)
 where `h0` is the **BOS-position decoder hidden state** of view $h$.
 
 **Training loss.** `compute_all_layers_loss` — for each view, the mean
-of per-layer symmetric InfoNCE across $\ell = 1, \ldots, L-1$.
+of per-layer symmetric InfoNCE across $\ell = 0, \ldots, L-1$.
 
 Per-layer loss (`compute_layer_loss_infonce`):
 - Positives: diagonal of the in-batch cosine matrix
@@ -268,7 +262,7 @@ fused_scores ← expanded_log_probas + λ_ℓ * reranker_lp
 
 ### I.6  Training objective and two-stage pipeline
 
-**Stage 1 — tokenizer.** Train `MvRqVae` with
+**Stage 1 — tokenizer.** Train the OSQ-VAE tokenizer with
 
 ```
 loss = reconstruction_loss + quan_loss_weight * quantize_loss
@@ -419,11 +413,11 @@ We remove one component at a time from the full BARGE: **w/o ICA** disables the 
 | BARGE w/o DPD | 0.0308 | 0.0207 | 0.0469 | 0.0259 |
 | **BARGE** | **0.0369 ± 0.0009** | **0.0252 ± 0.0016** | **0.0544 ± 0.0007** | **0.0308 ± 0.0008** |
 
-Removing any component hurts on all metrics. DPD is the most important (≈15% drop in R@5 on both datasets); ICA and HPR bring smaller but consistent gains on top of it.
+Removing any component hurts on all metrics. DPD is the most important; ICA and HPR bring smaller but consistent gains on top of it.
 
 ### II.B  Codebook collision rate
 
-We report the collision rate of the SIDs produced by our multi-view RQ-VAE tokenizer on all three datasets. Let $N$ be the number of items and $U$ the number of distinct SIDs assigned by the tokenizer; the aggregate collision rate is defined as $1 - U / N$ (0% means every item receives a unique SID).
+We report the collision rate of the SIDs produced by our OSQ-VAE tokenizer on all three datasets. Let $N$ be the number of items and $U$ the number of distinct SIDs assigned by the tokenizer; the aggregate collision rate is defined as $1 - U / N$ (0% means every item receives a unique SID).
 
 | Dataset | # items $N$ | Tokenizer | # unique SIDs $U$ | Collision rate $1 - U/N$ |
 |---|:---:|:---:|:---:|:---:|
@@ -434,21 +428,21 @@ We report the collision rate of the SIDs produced by our multi-view RQ-VAE token
 | Amazon Toys    | 11924 | RQ-VAE          | 11660 | 2.21\% |
 | Amazon Toys    | 11924 | Ours (OSQ-VAE)  | 11886 | 0.32\% |
 
-Compared with the vanilla RQ-VAE tokenizer, our OSQ-VAE further reduces the collision rate on every dataset, keeping it below 0.5% (i.e. over 99.5% of items receive a unique SID).
+Compared with the vanilla RQ-VAE tokenizer, our OSQ-VAE further reduces the collision rate on every dataset, keeping it below 0.5%.
 
 ### II.C  Catalog size scaling
 
-The public Amazon splits used above contain on the order of $10^4$ items. To check that BARGE remains effective at a much larger scale, we additionally run it on an industrial dataset with **>100M users, >300k items and >100M interactions**, i.e. one order of magnitude more items and roughly four orders of magnitude more interactions than the public benchmarks. BARGE continues to outperform the baseline, indicating that the design does not rely on a small item space.
+The public Amazon splits used above contain on the order of $10^4$ items. To check that BARGE remains effective at a much larger scale, we additionally run it on an industrial dataset with **>100M users, >300k items and >100M interactions**, i.e. over an order of magnitude more items and two to three orders of magnitude more interactions than the public benchmarks. BARGE continues to outperform the baseline, indicating that the design does not rely on a small item space.
 
 ### II.D  Domain shift
 
-We also probe cross-domain transfer by taking the BARGE and TIGER checkpoint trained on Sports and evaluating it directly on Beauty without any fine-tuning. Both models produce essentially zero recommendation quality in this setting. This is expected and is a shared limitation of SID-based generative recommenders: the tokenizer's SIDs are constructed and specialised for one catalog, so the generator learns to predict the specific SID distribution; SIDs produced on a different catalog do not lie in the same code space, and the model cannot map to them without retraining the tokenizer. Trading cross-domain reusability for a domain-specialised representation is an inherent property of this family of methods, not a BARGE-specific artefact.
+We also probe cross-domain transfer by taking the BARGE and TIGER checkpoint trained on Sports and evaluating it directly on Beauty without any fine-tuning. Both models produce essentially zero recommendation quality in this setting. This is expected and is a shared limitation of SID-based generative recommenders: the tokenizer's SIDs are constructed and specialised for one catalog, so the generator learns to predict the specific SID distribution; SIDs produced on a different catalog do not lie in the same code space, and the model cannot map to them without retraining the tokenizer. Trading cross-domain reusability for a domain-specialised representation is an inherent property of this family of methods.
 
 
 
 ### II.E  Cold-start item experiment
 
-Following TIGER, we construct the cold-start set as follows: we deduplicate the last item of every user sequence and randomly sample 5% of them as cold-start items; during training these items are removed from both histories and targets, and the tokenizer (RQ-VAE / OSQ-VAE) is trained only on the remaining non-cold items. The frozen tokenizer is then used to assign SIDs to the cold items, and evaluation is performed on a complete test set. The codebook is fixed to `[256, 256, 256] + random suffix`.
+Following TIGER, we construct the cold-start set as follows: we deduplicate the last item of every user sequence and randomly sample 5% of them as cold-start items; during training these items are removed from both histories and targets, and the tokenizer (RQ-VAE / OSQ-VAE) is trained only on the remaining non-cold items. The frozen tokenizer is then used to assign SIDs to the cold items, and evaluation is performed on a complete test set. The codebook is fixed to `[256, 256, 256] + random suffix` for fair comparsion.
 
 Split on Amazon Toys: 374 / 7475 cold items (5%, seed=42), 18179 training samples.
 
@@ -459,7 +453,7 @@ Split on Amazon Toys: 374 / 7475 cold items (5%, seed=42), 18179 training sample
 
 ### II.F  Inference latency breakdown
 
-We profile BARGE's inference on the Amazon Toys test set and aggregate the per-tag timings into the four components introduced in Part I. The total wall-clock time is 851 ms/batch:
+We profile BARGE's inference on the Amazon Toys test set and aggregate the per-tag timings into the four components introduced in Part I.
 
 | Module | Share |
 |---|:---:|
@@ -469,5 +463,5 @@ We profile BARGE's inference on the Amazon Toys test set and aggregate the per-t
 | Other | ≈ 2.55% |
 
 1. **HPR is essentially free at inference.** The three HPR tags together account for only about **1%** of the total time, because each step performs just two small linear projections and one dot product.
-2. **DPD does not add latency through parallelism; the cost is paid in GPU memory.** The $H$ per-view decoders, output heads and beam kernels are executed on the same encoder memory as independent CUDA streams / batched GEMMs, and their compute overlaps almost entirely as long as the GPU is not saturated. Going from $H=1$ to $H=2$ therefore mostly increases **GPU memory** consumption (extra decoder weights, KV-cache and beam tensors) rather than wall-clock time — in essence, DPD trades **memory for inference speed**, fully utilising otherwise idle GPU capacity.
+2. **DPD is simply $H$ standard autoregressive decodings running side by side.** Each view performs a normal autoregressive beam search over the shared encoder memory; there is no custom parallelisation — the two decodings just execute concurrently on the GPU. The 94.63% share above is therefore the beam-search cost that exists even at $H{=}1$, and going from $H{=}1$ to $H{=}2$ mainly increases **GPU memory** consumption (extra decoder weights, KV-cache and beam tensors) rather than adding a serial latency stage.
 
